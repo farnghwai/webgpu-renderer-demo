@@ -28,7 +28,8 @@
       border-radius: 8px;
       font-size: 13px;
       line-height: 1.35;
-      max-width: 420px;
+      max-width: min(520px, calc(100vw - 24px));
+      white-space: pre-wrap;
       backdrop-filter: blur(8px);
     }
   </style>
@@ -51,22 +52,86 @@ function fail(message) {
 }
 
 // WebGPU normally requires HTTPS or localhost.
+const startupLog = [
+  `Secure context: ${window.isSecureContext ? 'yes' : 'no'}`,
+  `Origin: ${location.origin}`,
+  `Chrome/WebView UA: ${navigator.userAgent}`
+];
+setStatus(startupLog.join('\n'));
+
 if (!('gpu' in navigator)) {
-  fail('WebGPU is not available in this browser. Try recent Chrome/Edge, Safari 26+, or a WebGPU-enabled Firefox build.');
+  fail([
+    'WebGPU is not available in this browser.',
+    '',
+    'Check:',
+    '1. Use Chrome/Edge 121+ on Android 12+, or a newer browser with WebGPU.',
+    '2. Load from HTTPS. On a phone, http://192.168.x.x is NOT a secure context.',
+    '3. Try GitHub Pages, localhost on the phone itself, or Chrome secure-origin flags for local testing.'
+  ].join('\n'));
 }
 
-const adapter = await navigator.gpu.requestAdapter({
-  powerPreference: 'high-performance'
-});
+async function tryAdapter(label, options) {
+  startupLog.push(`Trying adapter: ${label}`);
+  setStatus(startupLog.join('\n'));
+
+  try {
+    const result = await navigator.gpu.requestAdapter(options);
+    if (result) {
+      startupLog.push(`Adapter found: ${label}`);
+      setStatus(startupLog.join('\n'));
+      return { adapter: result, adapterLabel: label };
+    }
+    startupLog.push(`No adapter: ${label}`);
+  } catch (error) {
+    startupLog.push(`Adapter error (${label}): ${error?.message || error}`);
+  }
+
+  setStatus(startupLog.join('\n'));
+  return null;
+}
+
+// Mobile-friendly order:
+// 1. Try compatibility mode first. This can help Android devices that lack full Vulkan/core WebGPU.
+// 2. Try the default adapter. It is usually the safest choice on mobile.
+// 3. Try low-power. This can be better on battery-powered devices.
+// 4. Try high-performance last. Some mobile devices do not expose a separate high-performance adapter.
+const adapterAttempts = [
+  ['compatibility', { featureLevel: 'compatibility' }],
+  ['default', undefined],
+  ['low-power', { powerPreference: 'low-power' }],
+  ['high-performance', { powerPreference: 'high-performance' }]
+];
+
+let adapter;
+let adapterLabel = 'unknown';
+for (const [label, options] of adapterAttempts) {
+  const found = await tryAdapter(label, options);
+  if (found) {
+    adapter = found.adapter;
+    adapterLabel = found.adapterLabel;
+    break;
+  }
+}
 
 if (!adapter) {
-  fail('No compatible GPU adapter was found.');
+  fail([
+    'No compatible GPU adapter was found.',
+    '',
+    'This usually means Chrome exposes navigator.gpu, but your current phone/browser/GPU backend is blocked or unsupported.',
+    '',
+    'Try:',
+    '1. Update Chrome and Android.',
+    '2. Test from HTTPS, not plain http://192.168.x.x.',
+    '3. Open chrome://gpu and look for WebGPU / blocklist messages.',
+    '4. Try chrome://flags/#enable-unsafe-webgpu for local testing only.',
+    '5. Try a newer Chrome version if compatibility mode is unavailable.'
+  ].join('\n'));
 }
 
 const device = await adapter.requestDevice();
 device.lost.then((info) => {
   console.error('WebGPU device lost:', info);
-  setStatus(`WebGPU device lost: ${info.message || info.reason}`);
+  setStatus(`WebGPU device lost (${adapterLabel}): ${info.message || info.reason}`);
 });
 
 const context = canvas.getContext('webgpu');
@@ -524,13 +589,13 @@ function render(nowMs) {
     fps = Math.round(frameCount * 1000 / (nowMs - fpsTime));
     frameCount = 0;
     fpsTime = nowMs;
-    setStatus(`Raw WebGPU PBR metallic sphere Â· ${fps} FPS Â· ${currentWidth}Ã—${currentHeight}`);
+    setStatus(`Raw WebGPU PBR metallic sphere Â· ${fps} FPS Â· ${currentWidth}Ã—${currentHeight} Â· adapter: ${adapterLabel}`);
   }
 
   requestAnimationFrame(render);
 }
 
-setStatus('WebGPU initialized. Renderingâ€¦');
+setStatus(`WebGPU initialized. Renderingâ€¦ Â· adapter: ${adapterLabel}`);
 requestAnimationFrame(render);
 </script>
 </body>
