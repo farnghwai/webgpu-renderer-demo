@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Raw WebGPU PBR Metallic Sphere</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #08090d;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+    #status {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      color: white;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.35;
+      max-width: 420px;
+      backdrop-filter: blur(8px);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gpuCanvas"></canvas>
+  <div id="status">Starting WebGPUâ€¦</div>
+
+<script type="module">
+const canvas = document.getElementById('gpuCanvas');
+const statusEl = document.getElementById('status');
+
+function setStatus(message) {
+  statusEl.textContent = message;
+}
+
+function fail(message) {
+  setStatus(message);
+  throw new Error(message);
+}
+
+// WebGPU normally requires HTTPS or localhost.
+if (!('gpu' in navigator)) {
+  fail('WebGPU is not available in this browser. Try recent Chrome/Edge, Safari 26+, or a WebGPU-enabled Firefox build.');
+}
+
+const adapter = await navigator.gpu.requestAdapter({
+  powerPreference: 'high-performance'
+});
+
+if (!adapter) {
+  fail('No compatible GPU adapter was found.');
+}
+
+const device = await adapter.requestDevice();
+device.lost.then((info) => {
+  console.error('WebGPU device lost:', info);
+  setStatus(`WebGPU device lost: ${info.message || info.reason}`);
+});
+
+const context = canvas.getContext('webgpu');
+if (!context) {
+  fail('Could not create a WebGPU canvas context.');
+}
+
+const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+
+context.configure({
+  device,
+  format: presentationFormat,
+  alphaMode: 'opaque'
+});
+
+// ---------- Geometry: UV sphere ----------
+function createSphere(radius = 1, latitudeBands = 64, longitudeBands = 128) {
+  const vertices = [];
+  const indices = [];
+
+  for (let lat = 0; lat <= latitudeBands; lat++) {
+    const theta = lat * Math.PI / latitudeBands;
+    const sinTheta = Math.sin(theta);
+    const cosTheta = Math.cos(theta);
+
+    for (let lon = 0; lon <= longitudeBands; lon++) {
+      const phi = lon * 2 * Math.PI / longitudeBands;
+      const sinPhi = Math.sin(phi);
+      const cosPhi = Math.cos(phi);
+
+      const x = sinTheta * cosPhi;
+      const y = cosTheta;
+      const z = sinTheta * sinPhi;
+      const u = lon / longitudeBands;
+      const v = 1 - lat / latitudeBands;
+
+      // position.xyz, normal.xyz, uv.xy
+      vertices.push(radius * x, radius * y, radius * z, x, y, z, u, v);
+    }
+  }
+
+  const rowStride = longitudeBands + 1;
+  for (let lat = 0; lat < latitudeBands; lat++) {
+    for (let lon = 0; lon < longitudeBands; lon++) {
+      const a = lat * rowStride + lon;
+      const b = a + rowStride;
+      const c = b + 1;
+      const d = a + 1;
+
+      indices.push(a, b, d);
+      indices.push(b, c, d);
+    }
+  }
+
+  return {
+    vertices: new Float32Array(vertices),
+    indices: new Uint32Array(indices)
+  };
+}
+
+const sphere = createSphere(1, 64, 128);
+
+const vertexBuffer = device.createBuffer({
+  label: 'sphere vertex buffer',
+  size: sphere.vertices.byteLength,
+  usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+});
+device.queue.writeBuffer(vertexBuffer, 0, sphere.vertices);
+
+const indexBuffer = device.createBuffer({
+  label: 'sphere index buffer',
+  size: sphere.indices.byteLength,
+  usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+});
+device.queue.writeBuffer(indexBuffer, 0, sphere.indices);
+
+// ---------- Math helpers, column-major matrices ----------
+function normalize3(v) {
+  const len = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / len, v[1] / len, v[2] / len];
+}
+
+function cross(a, b) {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0]
+  ];
+}
+
+function dot(a, b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function mat4PerspectiveZO(fovyRadians, aspect, near, far) {
+  // WebGPU uses a 0..1 depth range, unlike OpenGL's -1..1 range.
+  const f = 1 / Math.tan(fovyRadians / 2);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, far / (near - far), -1,
+    0, 0, (near * far) / (near - far), 0
+  ]);
+}
+
+function mat4LookAt(eye, center, up) {
+  const z = normalize3([
+    eye[0] - center[0],
+    eye[1] - center[1],
+    eye[2] - center[2]
+  ]);
+  const x = normalize3(cross(up, z));
+  const y = cross(z, x);
+
+  return new Float32Array([
+    x[0], y[0], z[0], 0,
+    x[1], y[1], z[1], 0,
+    x[2], y[2], z[2], 0,
+    -dot(x, eye), -dot(y, eye), -dot(z, eye), 1
+  ]);
+}
+
+function mat4Multiply(a, b) {
+  // out = a * b, column-major.
+  const out = new Float32Array(16);
+  for (let col = 0; col < 4; col++) {
+    for (let row = 0; row < 4; row++) {
+      out[col * 4 + row] =
+        a[0 * 4 + row] * b[col * 4 + 0] +
+        a[1 * 4 + row] * b[col * 4 + 1] +
+        a[2 * 4 + row] * b[col * 4 + 2] +
+        a[3 * 4 + row] * b[col * 4 + 3];
+    }
+  }
+  return out;
+}
+
+function mat4RotationYX(yRadians, xRadians) {
+  const cy = Math.cos(yRadians);
+  const sy = Math.sin(yRadians);
+  const cx = Math.cos(xRadians);
+  const sx = Math.sin(xRadians);
+
+  const rotY = new Float32Array([
+    cy, 0, -sy, 0,
+    0, 1, 0, 0,
+    sy, 0, cy, 0,
+    0, 0, 0, 1
+  ]);
+
+  const rotX = new Float32Array([
+    1, 0, 0, 0,
+    0, cx, sx, 0,
+    0, -sx, cx, 0,
+    0, 0, 0, 1
+  ]);
+
+  return mat4Multiply(rotY, rotX);
+}
+
+// ---------- Uniforms ----------
+// model mat4, viewProjection mat4, normal matrix mat4,
+// cameraPos vec4, lightDir vec4, lightColor vec4, params vec4, baseColor vec4
+const uniformData = new Float32Array(68);
+const uniformBuffer = device.createBuffer({
+  label: 'uniform buffer',
+  size: uniformData.byteLength,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+});
+
+// ---------- Shader ----------
+const shaderCode = /* wgsl */ `
+struct Uniforms {
+  model: mat4x4<f32>,
+  viewProj: mat4x4<f32>,
+  normalMat: mat4x4<f32>,
+  cameraPos: vec4<f32>,
+  lightDir: vec4<f32>,
+  lightColor: vec4<f32>,
+  params: vec4<f32>,     // x=time, y=roughness, z=metallic, w=exposure
+  baseColor: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+struct VertexInput {
+  @location(0) position: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+  @builtin(position) clipPosition: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+  var output: VertexOutput;
+  let world = uniforms.model * vec4<f32>(input.position, 1.0);
+  output.clipPosition = uniforms.viewProj * world;
+  output.worldPos = world.xyz;
+  output.normal = normalize((uniforms.normalMat * vec4<f32>(input.normal, 0.0)).xyz);
+  output.uv = input.uv;
+  return output;
+}
+
+const PI: f32 = 3.14159265359;
+
+fn saturate(x: f32) -> f32 {
+  return clamp(x, 0.0, 1.0);
+}
+
+fn distributionGGX(n: vec3<f32>, h: vec3<f32>, roughness: f32) -> f32 {
+  let a = roughness * roughness;
+  let a2 = a * a;
+  let nDotH = max(dot(n, h), 0.0);
+  let nDotH2 = nDotH * nDotH;
+  let denom = nDotH2 * (a2 - 1.0) + 1.0;
+  return a2 / max(PI * denom * denom, 0.00001);
+}
+
+fn geometrySchlickGGX(nDotV: f32, roughness: f32) -> f32 {
+  let r = roughness + 1.0;
+  let k = (r * r) / 8.0;
+  return nDotV / max(nDotV * (1.0 - k) + k, 0.00001);
+}
+
+fn geometrySmith(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, roughness: f32) -> f32 {
+  let nDotV = max(dot(n, v), 0.0);
+  let nDotL = max(dot(n, l), 0.0);
+  let ggx1 = geometrySchlickGGX(nDotV, roughness);
+  let ggx2 = geometrySchlickGGX(nDotL, roughness);
+  return ggx1 * ggx2;
+}
+
+fn fresnelSchlick(cosTheta: f32, f0: vec3<f32>) -> vec3<f32> {
+  return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - saturate(cosTheta), 5.0);
+}
+
+fn acesTonemap(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((x * (a * x + vec3<f32>(b))) / (x * (c * x + vec3<f32>(d)) + vec3<f32>(e)), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn proceduralEnvironment(dir: vec3<f32>) -> vec3<f32> {
+  let t = saturate(dir.y * 0.5 + 0.5);
+  let ground = vec3<f32>(0.07, 0.065, 0.055);
+  let horizon = vec3<f32>(0.35, 0.39, 0.45);
+  let sky = vec3<f32>(0.78, 0.88, 1.0);
+  let base = mix(mix(ground, horizon, smoothstep(0.0, 0.55, t)), sky, smoothstep(0.55, 1.0, t));
+
+  let sun = pow(max(dot(normalize(dir), normalize(uniforms.lightDir.xyz)), 0.0), 256.0);
+  return base + uniforms.lightColor.rgb * sun * 2.0;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+  var n = normalize(input.normal);
+  let v = normalize(uniforms.cameraPos.xyz - input.worldPos);
+  let l = normalize(uniforms.lightDir.xyz);
+  let h = normalize(v + l);
+
+  // Subtle surface-locked brushed-metal bands make the rotation visible.
+  let brush = 0.5 + 0.5 * sin(input.uv.x * 110.0 + sin(input.uv.y * 18.0) * 2.0);
+  let equatorLine = 1.0 - 0.12 * (1.0 - smoothstep(0.006, 0.03, abs(input.uv.y - 0.5)));
+
+  let baseColor = uniforms.baseColor.rgb * (0.9 + brush * 0.1) * equatorLine;
+  let roughness = clamp(uniforms.params.y + brush * 0.035, 0.045, 1.0);
+  let metallic = clamp(uniforms.params.z, 0.0, 1.0);
+  let exposure = uniforms.params.w;
+
+  let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
+
+  let ndf = distributionGGX(n, h, roughness);
+  let g = geometrySmith(n, v, l, roughness);
+  let f = fresnelSchlick(max(dot(h, v), 0.0), f0);
+
+  let numerator = ndf * g * f;
+  let denominator = max(4.0 * max(dot(n, v), 0.0) * max(dot(n, l), 0.0), 0.0001);
+  let specular = numerator / denominator;
+
+  let kS = f;
+  let kD = (vec3<f32>(1.0) - kS) * (1.0 - metallic);
+  let nDotL = max(dot(n, l), 0.0);
+  let radiance = uniforms.lightColor.rgb * 6.0;
+  let direct = (kD * baseColor / PI + specular) * radiance * nDotL;
+
+  let r = reflect(-v, n);
+  let env = proceduralEnvironment(r);
+  let envFresnel = fresnelSchlick(max(dot(n, v), 0.0), f0);
+  let envSpecular = env * envFresnel * mix(1.0, 0.22, roughness);
+  let ambientDiffuse = baseColor * 0.025 * (1.0 - metallic);
+
+  var color = direct + envSpecular + ambientDiffuse;
+  color = acesTonemap(color * exposure);
+  color = pow(color, vec3<f32>(1.0 / 2.2));
+
+  return vec4<f32>(color, 1.0);
+}
+`;
+
+const shaderModule = device.createShaderModule({
+  label: 'pbr sphere shader',
+  code: shaderCode
+});
+
+const pipeline = device.createRenderPipeline({
+  label: 'pbr metallic sphere pipeline',
+  layout: 'auto',
+  vertex: {
+    module: shaderModule,
+    entryPoint: 'vs_main',
+    buffers: [
+      {
+        arrayStride: 8 * 4,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 3 * 4, format: 'float32x3' },
+          { shaderLocation: 2, offset: 6 * 4, format: 'float32x2' }
+        ]
+      }
+    ]
+  },
+  fragment: {
+    module: shaderModule,
+    entryPoint: 'fs_main',
+    targets: [{ format: presentationFormat }]
+  },
+  primitive: {
+    topology: 'triangle-list',
+    cullMode: 'back'
+  },
+  depthStencil: {
+    format: 'depth24plus',
+    depthWriteEnabled: true,
+    depthCompare: 'less'
+  },
+  multisample: {
+    count: 1
+  }
+});
+
+const bindGroup = device.createBindGroup({
+  label: 'uniform bind group',
+  layout: pipeline.getBindGroupLayout(0),
+  entries: [
+    {
+      binding: 0,
+      resource: { buffer: uniformBuffer }
+    }
+  ]
+});
+
+let depthTexture = null;
+let currentWidth = 0;
+let currentHeight = 0;
+
+function resizeCanvasAndDepthTexture() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+
+  if (width === currentWidth && height === currentHeight) {
+    return;
+  }
+
+  currentWidth = width;
+  currentHeight = height;
+  canvas.width = width;
+  canvas.height = height;
+
+  if (depthTexture) {
+    depthTexture.destroy();
+  }
+
+  depthTexture = device.createTexture({
+    label: 'depth texture',
+    size: [width, height],
+    format: 'depth24plus',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT
+  });
+}
+
+const cameraPosition = [0, 0.15, 3.3];
+const lightDirection = normalize3([-0.45, 0.82, 0.35]);
+const lightColor = [1.0, 0.95, 0.86];
+const baseMetalColor = [0.86, 0.88, 0.9];
+
+let frameCount = 0;
+let fpsTime = performance.now();
+let fps = 0;
+
+function render(nowMs) {
+  resizeCanvasAndDepthTexture();
+
+  const t = nowMs * 0.001;
+  const aspect = currentWidth / currentHeight;
+  const projection = mat4PerspectiveZO(45 * Math.PI / 180, aspect, 0.1, 100);
+  const view = mat4LookAt(cameraPosition, [0, 0, 0], [0, 1, 0]);
+  const viewProj = mat4Multiply(projection, view);
+  const model = mat4RotationYX(t * 0.8, Math.sin(t * 0.35) * 0.12);
+  const normalMat = model; // Correct for this example because model has rotation only.
+
+  uniformData.set(model, 0);
+  uniformData.set(viewProj, 16);
+  uniformData.set(normalMat, 32);
+  uniformData.set([cameraPosition[0], cameraPosition[1], cameraPosition[2], 1], 48);
+  uniformData.set([lightDirection[0], lightDirection[1], lightDirection[2], 0], 52);
+  uniformData.set([lightColor[0], lightColor[1], lightColor[2], 1], 56);
+  uniformData.set([t, 0.18, 1.0, 1.15], 60); // time, roughness, metallic, exposure
+  uniformData.set([baseMetalColor[0], baseMetalColor[1], baseMetalColor[2], 1], 64);
+  device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+  const commandEncoder = device.createCommandEncoder({
+    label: 'frame command encoder'
+  });
+
+  const renderPass = commandEncoder.beginRenderPass({
+    label: 'sphere render pass',
+    colorAttachments: [
+      {
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0.008, g: 0.01, b: 0.014, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store'
+      }
+    ],
+    depthStencilAttachment: {
+      view: depthTexture.createView(),
+      depthClearValue: 1,
+      depthLoadOp: 'clear',
+      depthStoreOp: 'store'
+    }
+  });
+
+  renderPass.setPipeline(pipeline);
+  renderPass.setBindGroup(0, bindGroup);
+  renderPass.setVertexBuffer(0, vertexBuffer);
+  renderPass.setIndexBuffer(indexBuffer, 'uint32');
+  renderPass.drawIndexed(sphere.indices.length, 1, 0, 0, 0);
+  renderPass.end();
+
+  device.queue.submit([commandEncoder.finish()]);
+
+  frameCount++;
+  if (nowMs - fpsTime > 500) {
+    fps = Math.round(frameCount * 1000 / (nowMs - fpsTime));
+    frameCount = 0;
+    fpsTime = nowMs;
+    setStatus(`Raw WebGPU PBR metallic sphere Â· ${fps} FPS Â· ${currentWidth}Ã—${currentHeight}`);
+  }
+
+  requestAnimationFrame(render);
+}
+
+setStatus('WebGPU initialized. Renderingâ€¦');
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
